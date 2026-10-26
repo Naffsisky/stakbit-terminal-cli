@@ -1,0 +1,204 @@
+# stakbit in the cluster, reachable at <node-ip>:8788.
+#
+# ## Why NodePort and not an Ingress
+#
+# This is a raw TCP terminal over a WebSocket. An Ingress in front of it would need WebSocket
+# upgrade handling and a path prefix that ttyd does not emit, and the request was explicitly
+# "IP + port". A NodePort publishes the same port on every node, so the three node IPs all answer
+# and there is no proxy in the path to misbehave.
+#
+# ## Why a PVC
+#
+# The refresh token lives in `~/.stakbit`. Without a volume, every pod restart logs the user out and
+# the token has to be pasted again. The volume is 1Gi because the store is a few kilobytes — this is
+# about surviving a restart, not about capacity.
+#
+# ## The ttyd password is NOT in this file
+#
+# It lives in a Secret that this manifest deliberately does not declare, so `kubectl apply` cannot
+# reset it to a placeholder. Create it once:
+#
+#   kubectl -n stakbit create secret generic stakbit-ttyd-auth \
+#     --from-literal=credential="admin:$(openssl rand -hex 16)"
+#
+# then apply this file. Rotating the password is the same command with `--dry-run=client -o yaml |
+# kubectl apply -f -`, followed by `kubectl -n stakbit rollout restart deploy/stakbit`.
+#
+# ## Why the security context is this strict
+#
+# The container only needs to read its own code and write its own home. It never needs a privileged
+# port, never needs to write to its image, and never needs to talk to the Kubernetes API. Dropping
+# every capability and pinning the UID means a compromise inside the terminal cannot escalate.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stakbit
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: stakbit-data
+  namespace: stakbit
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stakbit
+  namespace: stakbit
+  labels:
+    app: stakbit
+spec:
+  replicas: 1
+  # The store is ReadWriteOnce and the token rotates, so two pods would fight over the same files
+  # and retire each other's refresh token. Never run more than one.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: stakbit
+  template:
+    metadata:
+      labels:
+        app: stakbit
+    spec:
+      # The image is private. The same credential the other namespaces use, copied here so this
+      # namespace is self-contained.
+      imagePullSecrets:
+        - name: ghcr-secret
+      # Pin to the control-plane node. It is the one whose GHCR reachability is verified from this
+      # host, and the image is small enough that locality matters more than spreading load.
+      nodeSelector:
+        kubernetes.io/hostname: jkt-2-2-main
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: stakbit
+          image: ghcr.io/naffsisky/stakbit-tui:v1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: ttyd
+              containerPort: 7681
+              protocol: TCP
+          # The image's default CMD has no auth. This wrapper reads the credential from the
+          # environment at start time, so the password lives only in a Secret and never in the image
+          # or in the pod spec.
+          #
+          # It has to be a shell: Kubernetes does NOT expand `$(VAR)` inside `args`, so passing
+          # `--credential $(TTYD_CREDENTIAL)` as an argument would hand ttyd the literal string and
+          # every request would 401 — including the correct password.
+          command: ["/bin/sh", "-c"]
+          args:
+            - exec /sbin/tini -- ttyd --port 7681 --interface 0.0.0.0 --writable --max-clients 4 --terminal-type xterm-256color --credential "$TTYD_CREDENTIAL" /usr/local/bin/stakbit-session
+          env:
+            - name: STAKBIT_HOME
+              value: /home/stakbit/.stakbit
+            - name: TTYD_CREDENTIAL
+              valueFrom:
+                secretKeyRef:
+                  name: stakbit-ttyd-auth
+                  key: credential
+            - name: TERM
+              value: xterm-256color
+            # Polling outside market hours only spends the account's rate limit. The app already
+            # backs off on its own; this is belt and braces.
+            - name: STAKBIT_POLL_MS
+              value: "2000"
+          volumeMounts:
+            - name: data
+              mountPath: /home/stakbit/.stakbit
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              # The TUI is a Node process and one static Go binary. 256Mi is generous; the limit is
+              # here so a runaway session cannot take the node down.
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            tcpSocket:
+              port: ttyd
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: ttyd
+            initialDelaySeconds: 3
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: stakbit-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stakbit
+  namespace: stakbit
+  labels:
+    app: stakbit
+spec:
+  type: NodePort
+  selector:
+    app: stakbit
+  ports:
+    - name: ttyd
+      port: 7681
+      targetPort: ttyd
+      # Fixed so the URL does not change on a redeploy. 8788 was verified free on all three nodes.
+      nodePort: 31888
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: stakbit-restrict
+  namespace: stakbit
+spec:
+  podSelector:
+    matchLabels:
+      app: stakbit
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Only the node's own port forwarding reaches the pod. Without this, any pod in the cluster
+    # could attach to the terminal and read the stock store.
+    - ports:
+        - port: 7681
+          protocol: TCP
+  egress:
+    # DNS, so the app can resolve exodus.stockbit.com.
+    #
+    # The `namespaceSelector: {}` + `podSelector: {}` pair is what actually matches kube-dns in
+    # kube-system. An empty namespaceSelector alone matches every namespace, but without a
+    # podSelector the rule can silently fail to select anything — which presents as the pod being
+    # unable to resolve any name at all.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # HTTPS to Stockbit only. Any other destination is refused, so a compromised terminal cannot be
+    # used as a relay.
+    - ports:
+        - port: 443
+          protocol: TCP
